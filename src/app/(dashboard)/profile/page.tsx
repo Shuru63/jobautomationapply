@@ -282,7 +282,8 @@ export default function ProfilePage() {
       if (res.ok) {
         setMessage({ type: "success", text: "Profile saved successfully" });
       } else {
-        setMessage({ type: "error", text: "Failed to save profile" });
+        const errorData = await res.json().catch(() => null);
+        setMessage({ type: "error", text: errorData?.error || "Failed to save profile" });
       }
     } catch {
       setMessage({ type: "error", text: "Failed to save profile" });

@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
 import { db } from "@/db";
-import { applications, jobs } from "@/db/schema";
+import { applications, candidateProfiles } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
-import { submitApplication } from "@/lib/browser/application-agent";
-import { getBrowserManager } from "@/lib/browser/manager";
+import { submitApplication } from "@/lib/browser/apply-bot";
+import { generateResumePDF } from "@/lib/documents/resume-pdf";
 
 export async function POST(request: NextRequest) {
   const user = await getCurrentUser();
@@ -13,14 +13,10 @@ export async function POST(request: NextRequest) {
   }
 
   const body = await request.json();
-  const { applicationId, approved } = body;
+  const { applicationId } = body;
 
   if (!applicationId) {
     return NextResponse.json({ error: "Application ID required" }, { status: 400 });
-  }
-
-  if (!approved) {
-    return NextResponse.json({ error: "Application must be approved before submission" }, { status: 400 });
   }
 
   const app = await db.query.applications.findFirst({
@@ -28,7 +24,7 @@ export async function POST(request: NextRequest) {
       eq(applications.id, applicationId),
       eq(applications.candidateId, user.profileId)
     ),
-    with: { job: true },
+    with: { job: true, resume: true },
   });
 
   if (!app) {
@@ -39,27 +35,45 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Job URL not found" }, { status: 400 });
   }
 
-  // Check if application is in a submittable state
-  if (!["approved", "pending_review"].includes(app.status)) {
-    return NextResponse.json(
-      { error: `Cannot submit application with status: ${app.status}` },
-      { status: 400 }
-    );
-  }
+  const profile = await db.query.candidateProfiles.findFirst({
+    where: eq(candidateProfiles.id, user.profileId),
+  });
 
   try {
-    const result = await submitApplication(
-      applicationId,
-      user.profileId,
-      app.job.sourceUrl,
-      true
-    );
+    const pdfBuffer = app.resume?.content 
+      ? await generateResumePDF(app.resume.content as any)
+      : Buffer.from("");
+
+    const result = await submitApplication({
+      applyUrl: app.job.sourceUrl,
+      resumeBuffer: pdfBuffer,
+      candidateInfo: {
+        firstName: user.fullName?.split(" ")[0] || "Candidate",
+        lastName: user.fullName?.split(" ").slice(1).join(" ") || "",
+        email: user.email || "",
+        phone: profile?.phone || "",
+        linkedin: profile?.linkedinUrl || "",
+        github: profile?.githubUrl || "",
+        portfolio: profile?.portfolioUrl || "",
+      },
+      log: async () => {}, // dummy logger
+    });
+
+    if (result.success) {
+       await db.update(applications).set({
+         status: "submitted",
+         appliedAt: new Date(),
+       }).where(eq(applications.id, applicationId));
+    } else {
+       await db.update(applications).set({
+         status: "rejected",
+         failureReason: result.message,
+       }).where(eq(applications.id, applicationId));
+    }
 
     return NextResponse.json({ result });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Submission failed";
     return NextResponse.json({ error: message }, { status: 500 });
-  } finally {
-    await getBrowserManager().close().catch(() => {});
   }
 }

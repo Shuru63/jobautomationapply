@@ -11,6 +11,7 @@ export class BrowserManager {
       this.browser = await chromium.launch({
         headless: true,
         args: [
+          "--disable-http2",
           "--no-sandbox",
           "--disable-setuid-sandbox",
           "--disable-dev-shm-usage",

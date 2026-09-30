@@ -15,6 +15,23 @@ export interface CareerPageScraper {
   scrapeJobs(url: string): Promise<ScrapedJob[]>;
 }
 
+function stripHtml(html: string): string {
+  if (!html) return "";
+  const decoded = html
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&mdash;/gi, "-");
+
+  return decoded
+    .replace(/<[^>]*>?/gm, " ") // replace tags with space
+    .replace(/\s+/g, " ")       // collapse whitespace
+    .trim();
+}
+
 // ─── Greenhouse Scraper ─────────────────────────────────────────────────────
 
 export class GreenhouseScraper implements CareerPageScraper {
@@ -32,7 +49,7 @@ export class GreenhouseScraper implements CareerPageScraper {
       const data = await res.json();
       return (data.jobs || []).map((job: Record<string, unknown>) => ({
         title: job.title as string,
-        description: (job.content as string) || "",
+        description: stripHtml((job.content as string) || ""),
         location: (job.location as Record<string, string>)?.name || "",
         url: job.absolute_url as string,
         externalId: String(job.id),
@@ -59,7 +76,7 @@ export class LeverScraper implements CareerPageScraper {
       const data = await res.json();
       return (Array.isArray(data) ? data : []).map((job: Record<string, unknown>) => ({
         title: job.text as string,
-        description: (job.descriptionPlain as string) || (job.description as string) || "",
+        description: stripHtml((job.descriptionPlain as string) || (job.description as string) || ""),
         location: job.location as string || "",
         url: job.hostedUrl as string,
         externalId: job.id as string,

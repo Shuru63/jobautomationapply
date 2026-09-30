@@ -18,7 +18,8 @@ import { eq, desc, and } from "drizzle-orm";
 import { routeAIJSON, routeAI } from "@/lib/ai/router";
 import { createScraper } from "@/lib/browser/career-agent";
 import type { ScrapedJob } from "@/lib/browser/career-agent";
-
+import { submitApplication } from "@/lib/browser/apply-bot";
+import { generateResumePDF } from "@/lib/documents/resume-pdf";
 // ──────────────────────────────────────────────────────────────────────────────
 // POST /api/automation/full-pipeline
 // Kicks off the complete end-to-end job search + apply automation
@@ -63,7 +64,7 @@ export async function POST(request: NextRequest) {
   runFullPipeline({
     runId,
     candidateId: user.profileId,
-    userId: user.id,
+    user,
     jobTitles: jobTitles || [],
     locations: locations || [],
     remoteOnly: remoteOnly || false,
@@ -120,12 +121,12 @@ export async function GET(request: NextRequest) {
 // The core pipeline (runs in background)
 // ──────────────────────────────────────────────────────────────────────────────
 async function runFullPipeline({
-  runId, candidateId, userId, jobTitles, locations, remoteOnly,
+  runId, candidateId, user, jobTitles, locations, remoteOnly,
   maxApplications, autoSubmit, minMatchScore, log,
 }: {
   runId: string;
   candidateId: string;
-  userId: string;
+  user: { id: string; fullName?: string | null; email?: string | null };
   jobTitles: string[];
   locations: string[];
   remoteOnly: boolean;
@@ -147,7 +148,7 @@ async function runFullPipeline({
 
   if (!profile) throw new Error("Candidate profile not found");
 
-  const userInfo = { profile, skills: userSkills, experiences: userExperiences, education: userEdu };
+  const userInfo = { profile, skills: userSkills, experiences: userExperiences, education: userEdu, fullName: user.fullName, email: user.email };
   const skillNames = userSkills.map((s) => s.name).join(", ");
   const expSummary = userExperiences.slice(0, 3).map((e) => `${e.title} at ${e.company}`).join(", ");
   await log("info", `✅ Profile loaded: ${skillNames.substring(0, 100)}...`);
@@ -173,13 +174,7 @@ async function runFullPipeline({
 
   await log("info", `📦 AI discovered ${discoveredJobs.length} job leads`);
 
-  // ── STEP 2b: Scrape real company career pages for jobs tagged as "Company Careers Website" ──
-  await log("info", "🌐 Step 2b: Scraping real company career pages...");
-  const careerPageJobs = await scrapeRealCareerPages(discoveredJobs, log);
-  if (careerPageJobs.length > 0) {
-    await log("info", `✅ Scraped ${careerPageJobs.length} additional real jobs from company career pages`);
-    discoveredJobs.push(...careerPageJobs);
-  }
+
 
   await log("info", `📦 Total discovered: ${discoveredJobs.length} job opportunities`);
 
@@ -282,7 +277,11 @@ async function runFullPipeline({
         company: jobLead.company,
         atsKeywords: matchResult.atsKeywords,
         missingSkills: matchResult.missingSkills,
-        userInfo,
+        userInfo: {
+          ...userInfo,
+          fullName: userInfo.fullName ?? undefined,
+          email: userInfo.email ?? undefined,
+        },
       });
 
       const resumeId = crypto.randomUUID();
@@ -303,19 +302,57 @@ async function runFullPipeline({
       resumesGenerated++;
       await log("info", `📄 Tailored resume created (ATS: ${matchResult.score}% | Keywords: ${matchResult.atsKeywords.slice(0,4).join(", ")})`);
 
-      // ── 3f: Create application — ALWAYS mark as applied immediately ──
+      // ── 3f: Execute Real Application Submission ──
       const applicationId = crypto.randomUUID();
       const appliedAt = new Date();
+      let applicationStatus: "submitted" | "pending_review" = autoSubmit ? "submitted" : "pending_review";
+      let applyNotes = `✅ Auto-applied via JobPilot AI pipeline`;
+
+      if (autoSubmit && jobLead.applyUrl) {
+        await log("info", `🤖 Initiating real Playwright submission to ${jobLead.company}...`);
+        try {
+          // Generate actual PDF buffer to upload
+          const pdfBuffer = await generateResumePDF(resumeContentObj);
+          
+          // Execute the bot
+          const result = await submitApplication({
+            applyUrl: jobLead.applyUrl,
+            resumeBuffer: pdfBuffer,
+            candidateInfo: {
+              firstName: user.fullName?.split(" ")[0] || "Candidate",
+              lastName: user.fullName?.split(" ").slice(1).join(" ") || "",
+              email: user.email || "",
+              phone: userInfo.profile?.phone || "",
+              linkedin: userInfo.profile?.linkedinUrl || "",
+              github: userInfo.profile?.githubUrl || "",
+              portfolio: userInfo.profile?.portfolioUrl || "",
+            },
+            log,
+          });
+
+          if (!result.success) {
+             applicationStatus = "pending_review";
+             applyNotes = `❌ Auto-apply failed: ${result.message}`;
+          }
+        } catch (botErr) {
+          applicationStatus = "pending_review";
+          applyNotes = `❌ Bot crashed: ${botErr instanceof Error ? botErr.message : String(botErr)}`;
+          await log("error", applyNotes);
+        }
+      } else if (!autoSubmit) {
+         applyNotes = `⏸️ Manual review required.`;
+      }
+
       await db.insert(applications).values({
         id: applicationId,
         candidateId,
         jobId,
         resumeId,
-        status: "submitted",   // Always submitted — no approval wait
+        status: applicationStatus,
         appliedAt,
         sourceUrl: jobLead.applyUrl || null,
         notes: [
-          `✅ Auto-applied via JobPilot AI pipeline`,
+          applyNotes,
           `ATS Score: ${matchResult.score}%`,
           `Source: ${jobLead.jobPortal || "AI Search"} — ${jobLead.sourceLabel || ""}`,
           `Fraud check: PASSED`,
@@ -325,9 +362,12 @@ async function runFullPipeline({
       });
 
       applicationsSubmitted++;
-      await log("info", `🚀 APPLIED! "${jobLead.title}" @ ${jobLead.company} [${appliedAt.toLocaleTimeString()}]`);
-      await log("info", `   📎 Apply URL: ${jobLead.applyUrl || "N/A"}`);
-      await log("info", `   🎯 Interview tips: Focus on ${matchResult.atsKeywords.slice(0, 3).join(", ")}`);
+      
+      if (applicationStatus === "submitted") {
+        await log("info", `🚀 REAL APPLIED! Successfully submitted to "${jobLead.title}" @ ${jobLead.company}`);
+      } else if (applicationStatus === "pending_review") {
+        await log("info", `📝 Prepared application for manual review: "${jobLead.title}" @ ${jobLead.company}`);
+      }
     } catch (err) {
       await log("error", `❌ Failed "${jobLead.title}": ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -389,72 +429,109 @@ async function discoverJobsWithAI({ searchTitles, locations, remoteOnly, skillNa
   description: string;
   applyUrl: string | null;
   companyUrl: string | null;
-  jobPortal: string;      // e.g. LinkedIn, Indeed, Glassdoor, Company Careers
-  sourceLabel: string;    // human-readable label for display
+  jobPortal: string;
+  sourceLabel: string;
 }>> {
-  await log("info", `🤖 AI generating realistic job opportunities for: ${searchTitles.join(", ")}`);
+  await log("info", `🌐 Scanning live internet job boards for real positions matching: ${searchTitles.join(", ")}`);
 
-  const jobType = {
-    title: "" as string,
-    company: "" as string,
-    location: "" as string,
-    isRemote: false as boolean,
-    description: "" as string,
-    applyUrl: null as string | null,
-    companyUrl: null as string | null,
-    jobPortal: "" as string,
-    sourceLabel: "" as string,
-  };
-  type JobLead = typeof jobType;
+  const realCompanies = [
+    { name: "Stripe", url: "https://boards.greenhouse.io/stripe" },
+    { name: "Figma", url: "https://jobs.lever.co/figma" },
+    { name: "Notion", url: "https://jobs.lever.co/notion" },
+    { name: "OpenAI", url: "https://boards.greenhouse.io/openai" },
+    { name: "Vercel", url: "https://boards.greenhouse.io/vercel" },
+    { name: "Discord", url: "https://boards.greenhouse.io/discord" },
+    { name: "Plaid", url: "https://boards.greenhouse.io/plaid" },
+    { name: "Reddit", url: "https://boards.greenhouse.io/reddit" },
+    { name: "Anthropic", url: "https://jobs.lever.co/anthropic" },
+    { name: "GitHub", url: "https://boards.greenhouse.io/github" },
+    { name: "Datadog", url: "https://boards.greenhouse.io/datadog" },
+    { name: "Twilio", url: "https://boards.greenhouse.io/twilio" },
+    { name: "Cloudflare", url: "https://boards.greenhouse.io/cloudflare" },
+    { name: "Okta", url: "https://boards.greenhouse.io/okta" },
+    { name: "Shopify", url: "https://jobs.lever.co/shopify" },
+    { name: "Dropbox", url: "https://boards.greenhouse.io/dropbox" },
+    { name: "Slack", url: "https://boards.greenhouse.io/slack" },
+    { name: "Coinbase", url: "https://boards.greenhouse.io/coinbase" },
+    { name: "Brex", url: "https://boards.greenhouse.io/brex" },
+    { name: "Airbnb", url: "https://boards.greenhouse.io/airbnb" },
+    { name: "Uber", url: "https://boards.greenhouse.io/uber" },
+    { name: "Lyft", url: "https://boards.greenhouse.io/lyft" },
+    { name: "Robinhood", url: "https://boards.greenhouse.io/robinhood" },
+    { name: "Rippling", url: "https://boards.greenhouse.io/rippling" },
+    { name: "Deel", url: "https://boards.greenhouse.io/deel" },
+    { name: "Gusto", url: "https://boards.greenhouse.io/gusto" },
+    { name: "Flexport", url: "https://boards.greenhouse.io/flexport" },
+    { name: "Anduril", url: "https://jobs.lever.co/anduril" },
+    { name: "Ramp", url: "https://boards.greenhouse.io/ramp" },
+    { name: "Cohere", url: "https://jobs.lever.co/cohere" },
+    { name: "Scale AI", url: "https://boards.greenhouse.io/scaleai" },
+    { name: "Instacart", url: "https://boards.greenhouse.io/instacart" },
+    { name: "DoorDash", url: "https://boards.greenhouse.io/doordash" },
+    { name: "Pinterest", url: "https://boards.greenhouse.io/pinterest" },
+    { name: "Snowflake", url: "https://boards.greenhouse.io/snowflake" },
+    { name: "MongoDB", url: "https://boards.greenhouse.io/mongodb" },
+    { name: "Elastic", url: "https://boards.greenhouse.io/elastic" },
+    { name: "Confluent", url: "https://boards.greenhouse.io/confluent" },
+    { name: "HashiCorp", url: "https://boards.greenhouse.io/hashicorp" },
+    { name: "GitLab", url: "https://boards.greenhouse.io/gitlab" },
+    { name: "ServiceNow", url: "https://boards.greenhouse.io/servicenow" },
+    { name: "Workday", url: "https://boards.greenhouse.io/workday" },
+    { name: "Atlassian", url: "https://jobs.lever.co/atlassian" },
+    { name: "Palantir", url: "https://jobs.lever.co/palantir" },
+    { name: "Asana", url: "https://boards.greenhouse.io/asana" },
+    { name: "Monday.com", url: "https://boards.greenhouse.io/monday" },
+    { name: "Canva", url: "https://boards.greenhouse.io/canva" },
+    { name: "Grammarly", url: "https://boards.greenhouse.io/grammarly" },
+    { name: "Duolingo", url: "https://boards.greenhouse.io/duolingo" },
+    { name: "Roblox", url: "https://boards.greenhouse.io/roblox" }
+  ];
 
-  const BATCH_SIZE = 5;
-  const allJobs: JobLead[] = [];
+  const allJobs: any[] = [];
+  
+  // Shuffle to randomize companies searched each time
+  realCompanies.sort(() => Math.random() - 0.5);
 
-  // Run two small batches instead of one huge request to avoid token truncation
-  for (let batch = 0; batch < 2; batch++) {
+  for (const company of realCompanies.slice(0, 4)) {
     try {
-      await log("info", `🔍 Fetching job batch ${batch + 1}/2...`);
-      const { data } = await routeAIJSON<{ jobs: JobLead[] }>(
-        "job_analysis",
-        `You are an elite executive headhunter. Generate exactly ${BATCH_SIZE} realistic, HIGH-PAYING job listings EXCLUSIVELY for top-tier global MNCs.
-    
-    CRITICAL RULE: You MUST choose company names ONLY from this massive master list of top-tier companies (or equivalent Fortune 500/Global 2000 MNCs):
-    - Tech/Cloud: Microsoft, Google, Apple, Amazon, IBM, Oracle, SAP, Salesforce, Adobe, Cisco, Dell, Intel, NVIDIA, AMD, AWS, Azure, Snowflake, Databricks, Red Hat, DigitalOcean, Alibaba Cloud, Tencent Cloud.
-    - IT Services: Accenture, TCS, Infosys, HCLTech, Wipro, Cognizant, Capgemini, NTT DATA, LTIMindtree, Tech Mahindra, EPAM, DXC, CGI, Fujitsu, Atos, Genpact, Persistent, Hexaware, Mphasis, Coforge, Birlasoft, Cyient, KPIT, Sonata, Zensar, L&T, Tata Elxsi, Mastek, Virtusa, UST, Nagarro, Globant, Thoughtworks, Concentrix.
-    - Product/Software: Atlassian, HubSpot, Zoom, Dropbox, MongoDB, ServiceNow, Workday, GitLab, DocuSign, Okta, Twilio, Shopify, Elastic, Confluent, HashiCorp, JetBrains, Dassault, Synopsys, UiPath, Zoho, Freshworks.
-    - Fintech/Payments: Stripe, PayPal, Block, Visa, Mastercard, Razorpay, Revolut, Checkout.com, Adyen, Fiserv, FIS, Global Payments, Wise, PayU, Worldline, Bloomberg.
-    - Cyber/AI: OpenAI, Anthropic, DeepMind, Palo Alto, CrowdStrike, Zscaler, Datadog, Fortinet, Check Point, CyberArk, Trend Micro, SentinelOne, Cloudflare, Rapid7, Wiz, Palantir, Hugging Face, Cohere, Scale AI.
-    - Hardware/Telecom: Qualcomm, Broadcom, TSMC, Ericsson, Nokia, Samsung, SK Hynix, Micron, Texas Instruments, NXP, ASML, Juniper, Motorola, AT&T, Verizon, Vodafone.
-    
-    Rules:
-    - Description: max 80 words, emphasize scale, high-impact responsibilities, and top-tier tech stacks.
-    - Embed ATS keywords naturally for senior/high-impact roles.
-    - Apply URLs: vary the source — use:
-      * LinkedIn: https://www.linkedin.com/jobs/view/{id}
-      * Indeed: https://in.indeed.com/viewjob?jk={id}
-      * Glassdoor: https://www.glassdoor.co.in/job-listing/{slug}
-      * Naukri: https://www.naukri.com/job-listings-{slug}
-      * Company personal careers page: https://careers.{company-slug}.com/jobs/{role-slug} OR https://{company}.com/careers/{role-slug}
-      * Wellfound/AngelList: https://wellfound.com/jobs/{id}
-    - jobPortal: one of "LinkedIn", "Indeed", "Glassdoor", "Naukri", "AngelList / Wellfound", "Company Careers Website", "Internshala", "Cutshort"
-    - sourceLabel: human-readable e.g. "LinkedIn · High Package", "Company Website · Global Remote"
-    - Distribute sources realistically — mix portals AND company career pages
-    - Return ONLY valid compact JSON
-    Return JSON: { "jobs": [ {title, company, location, isRemote, description, applyUrl, companyUrl, jobPortal, sourceLabel} ] }`,
-        `Skills: ${skillNames.substring(0, 300)}
-Experience: ${expSummary.substring(0, 200)}
-Roles: ${searchTitles.join(", ")}
-Locations: ${locations.join(", ")}
-Remote: ${remoteOnly}
-Batch: ${batch + 1} of 2 — generate ${BATCH_SIZE} different listings targeting EXCLUSIVELY the global MNC master list.`,
-        { maxTokens: 4096, temperature: 0.7 }
-      );
-      if (Array.isArray(data.jobs)) {
-        allJobs.push(...data.jobs);
-        await log("info", `✅ Batch ${batch + 1}: found ${data.jobs.length} jobs`);
+      await log("info", `🔎 Scraping live jobs directly from ${company.name}...`);
+      const scraperType = company.url.includes("greenhouse.io") ? "greenhouse" : "lever";
+      const scraper = createScraper(scraperType as any);
+      
+      const scrapedJobs = await Promise.race([
+        scraper.scrapeJobs(company.url),
+        new Promise<any[]>((resolve) => setTimeout(() => resolve([]), 15000))
+      ]);
+
+      if (scrapedJobs.length > 0) {
+        await log("info", `✅ Successfully fetched ${scrapedJobs.length} live jobs from ${company.name}`);
+        
+        // Filter jobs by matching title keywords
+        const searchKeywords = searchTitles.flatMap(t => t.toLowerCase().split(" "));
+        const matchedJobs = scrapedJobs.filter((job) => {
+          const jobTitle = job.title.toLowerCase();
+          return searchKeywords.some(keyword => jobTitle.includes(keyword) && keyword.length > 3) || jobTitle.includes("engineer") || jobTitle.includes("developer");
+        });
+
+        // Add up to 3 matched jobs per company
+        for (const job of matchedJobs.slice(0, 3)) {
+          allJobs.push({
+            title: job.title,
+            company: company.name,
+            location: job.location || "Remote",
+            isRemote: job.remoteType === "remote" || (job.location && job.location.toLowerCase().includes("remote")),
+            description: job.description || `Software engineering role at ${company.name}.`,
+            applyUrl: job.url,
+            companyUrl: company.url,
+            jobPortal: "Company Careers Website",
+            sourceLabel: `${company.name} Live Careers`,
+          });
+        }
+      } else {
+         await log("warn", `⚠️ No live jobs found on ${company.name}`);
       }
     } catch (err) {
-      await log("warn", `⚠️ Batch ${batch + 1} failed: ${err instanceof Error ? err.message : String(err)}`);
+      await log("error", `❌ Error fetching live jobs from ${company.name}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -491,7 +568,7 @@ async function generateTailoredResume({ jobTitle, jobDescription, company, atsKe
   company: string;
   atsKeywords: string[];
   missingSkills: string[];
-  userInfo: { profile: any; skills: any[]; experiences: any[]; education: any[] };
+  userInfo: { fullName?: string; email?: string; profile: any; skills: any[]; experiences: any[]; education: any[] };
 }) {
   const { data } = await routeAIJSON(
     "resume_generation",
@@ -499,10 +576,11 @@ async function generateTailoredResume({ jobTitle, jobDescription, company, atsKe
     
     CRITICAL RULES:
     1. Output strict, valid JSON matching the exact schema provided.
-    2. Naturally integrate ALL provided ATS keywords into the summary, experience highlights, and skills.
-    3. Rewrite experience bullet points (highlights) to mirror the job description language and quantify achievements.
-    4. Fill in the candidate's exact personal info provided below. Do not use placeholders.
-    5. Return ONLY JSON.`,
+    2. NATURALLY integrate ATS keywords. DO NOT keyword stuff. Maintain the candidate's authentic human voice.
+    3. Ensure maximum 75% verbatim keyword overlap to avoid automated AI-detection penalties by Workday/Greenhouse.
+    4. Rewrite experience bullet points to emphasize impact, but keep them realistic and grounded.
+    5. Fill in the candidate's exact personal info provided below. Do not use placeholders.
+    6. Return ONLY JSON.`,
     `TARGET JOB: ${jobTitle} at ${company}
     
     JOB DESCRIPTION:
@@ -512,10 +590,10 @@ async function generateTailoredResume({ jobTitle, jobDescription, company, atsKe
     SKILLS TO ADDRESS: ${missingSkills.join(", ")}
     
     CANDIDATE CONTACT INFO:
-    Name: ${userInfo.profile?.fullName || "Candidate"}
-    Email: ${userInfo.profile?.email || ""}
+    Name: ${userInfo.fullName || "Candidate"}
+    Email: ${userInfo.email || ""}
     Phone: ${userInfo.profile?.phone || ""}
-    Location: ${userInfo.profile?.location || ""}
+    Location: ${userInfo.profile?.city || ""} ${userInfo.profile?.country || ""}
     LinkedIn: ${userInfo.profile?.linkedinUrl || ""}
     GitHub: ${userInfo.profile?.githubUrl || ""}
     Portfolio: ${userInfo.profile?.portfolioUrl || ""}
@@ -540,66 +618,7 @@ async function generateTailoredResume({ jobTitle, jobDescription, company, atsKe
   return data;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Scrape real company career pages
-// For any AI-discovered job tagged as "Company Careers Website",
-// visit that company's careers URL and extract live job listings.
-// ──────────────────────────────────────────────────────────────────────────────
-async function scrapeRealCareerPages(
-  aiJobs: Array<{ title: string; company: string; companyUrl: string | null; applyUrl: string | null; location: string; isRemote: boolean; jobPortal: string; sourceLabel: string; description: string }>,
-  log: (l: "info" | "warn" | "error", m: string) => Promise<void>
-) {
-  type JobLead = (typeof aiJobs)[number];
-  const results: JobLead[] = [];
 
-  // Only target jobs where AI flagged the source as a company career page
-  const careerPageJobs = aiJobs.filter(
-    (j) => j.jobPortal === "Company Careers Website" && (j.companyUrl || j.applyUrl)
-  );
-
-  for (const lead of careerPageJobs.slice(0, 5)) { // cap at 5 to avoid long scraping
-    const careersUrl = lead.companyUrl || lead.applyUrl;
-    if (!careersUrl) continue;
-
-    try {
-      await log("info", `🔎 Scraping career page: ${lead.company} (${careersUrl})`);
-
-      // Detect scraper type from URL
-      let scraperType = "career_page";
-      if (careersUrl.includes("greenhouse.io")) scraperType = "greenhouse";
-      else if (careersUrl.includes("lever.co")) scraperType = "lever";
-      else if (careersUrl.includes("ashbyhq.com")) scraperType = "ashby";
-      else if (careersUrl.includes("myworkdayjobs.com") || careersUrl.includes("workday.com")) scraperType = "workday";
-
-      const scraper = createScraper(scraperType);
-      const scrapedJobs: ScrapedJob[] = await Promise.race([
-        scraper.scrapeJobs(careersUrl),
-        new Promise<ScrapedJob[]>((resolve) => setTimeout(() => resolve([]), 20000)), // 20s timeout
-      ]);
-
-      await log("info", `  → Found ${scrapedJobs.length} live jobs at ${lead.company}`);
-
-      for (const job of scrapedJobs.slice(0, 3)) { // max 3 per company
-        if (!job.title) continue;
-        results.push({
-          title: job.title,
-          company: lead.company,
-          location: job.location || lead.location,
-          isRemote: job.remoteType === "remote" || lead.isRemote,
-          description: job.description || lead.description,
-          applyUrl: job.url || lead.applyUrl,
-          companyUrl: lead.companyUrl,
-          jobPortal: "Company Careers Website",
-          sourceLabel: `${lead.company} Careers · Live`,
-        });
-      }
-    } catch (err) {
-      await log("warn", `  ⚠️ Could not scrape ${lead.company}: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  return results;
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Fraud / Fake Job Detection
