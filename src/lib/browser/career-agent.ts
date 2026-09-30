@@ -111,10 +111,11 @@ export class AshbyScraper implements CareerPageScraper {
 export class WorkdayScraper implements CareerPageScraper {
   async scrapeJobs(url: string): Promise<ScrapedJob[]> {
     const bm = getBrowserManager();
-    const page = await bm.newPage();
+    let page: Page | null = null;
     const jobs: ScrapedJob[] = [];
 
     try {
+      page = await bm.newPage();
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
       await page.waitForTimeout(3000);
 
@@ -168,7 +169,7 @@ export class WorkdayScraper implements CareerPageScraper {
     } catch (err) {
       console.error("Workday scrape error:", err);
     } finally {
-      await page.close();
+      if (page) await page.close().catch(() => {});
     }
 
     return jobs;
@@ -180,10 +181,11 @@ export class WorkdayScraper implements CareerPageScraper {
 export class GenericCareerScraper implements CareerPageScraper {
   async scrapeJobs(url: string): Promise<ScrapedJob[]> {
     const bm = getBrowserManager();
-    const page = await bm.newPage();
+    let page: Page | null = null;
     const jobs: ScrapedJob[] = [];
 
     try {
+      page = await bm.newPage();
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
       await page.waitForTimeout(2000);
 
@@ -247,7 +249,7 @@ export class GenericCareerScraper implements CareerPageScraper {
     } catch (err) {
       console.error("Generic career page scrape error:", err);
     } finally {
-      await page.close();
+      if (page) await page.close().catch(() => {});
     }
 
     return jobs;

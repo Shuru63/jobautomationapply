@@ -5,21 +5,26 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import type { ReactNode } from "react";
 
+import { 
+  LayoutDashboard, Briefcase, FileText, FileSignature, 
+  Building2, Users, BarChart3, Bot, Settings, User as UserIcon, Zap
+} from "lucide-react";
+
 type User = { id: string; email: string; fullName: string; role: string; profileId: string | null };
 
 const nav = [
-  { name: "Dashboard", href: "/dashboard" },
-  { name: "Jobs", href: "/jobs" },
-  { name: "Applications", href: "/applications" },
-  { name: "Resumes", href: "/resumes" },
-  { name: "Cover Letters", href: "/cover-letters" },
-  { name: "Companies", href: "/companies" },
-  { name: "Interviews", href: "/interviews" },
-  { name: "Analytics", href: "/analytics" },
-  { name: "🚀 Auto-Apply Pipeline", href: "/automation/pipeline" },
-  { name: "Automation", href: "/automation" },
-  { name: "Profile", href: "/profile" },
-  { name: "Settings", href: "/settings" },
+  { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
+  { name: "Jobs", href: "/jobs", icon: Briefcase },
+  { name: "Applications", href: "/applications", icon: FileText },
+  { name: "Resumes", href: "/resumes", icon: FileSignature },
+  { name: "Cover Letters", href: "/cover-letters", icon: FileText },
+  { name: "Companies", href: "/companies", icon: Building2 },
+  { name: "Interviews", href: "/interviews", icon: Users },
+  { name: "Analytics", href: "/analytics", icon: BarChart3 },
+  { name: "Auto-Apply Pipeline", href: "/automation/pipeline", icon: Zap },
+  { name: "Automation", href: "/automation", icon: Bot },
+  { name: "Profile", href: "/profile", icon: UserIcon },
+  { name: "Settings", href: "/settings", icon: Settings },
 ];
 
 export default function DashboardLayout({ children }: { children: ReactNode }) {
@@ -36,7 +41,10 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
     } catch { router.push("/login"); } finally { setLoading(false); }
   }, [router]);
 
-  useEffect(() => { fetchUser(); }, [fetchUser]);
+  useEffect(() => { 
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    fetchUser(); 
+  }, [fetchUser]);
 
   if (loading) return <div className="min-h-screen flex items-center justify-center"><div className="w-4 h-4 border-2 border-neutral-300 border-t-neutral-700 animate-spin" /></div>;
   if (!user) return null;
@@ -55,7 +63,8 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
             const active = pathname === item.href || (item.href !== "/dashboard" && pathname.startsWith(item.href));
             return (
               <Link key={item.name} href={item.href} onClick={() => setOpen(false)}
-                className={`block px-2.5 py-1.5 text-[13px] no-underline ${active ? "text-neutral-900 bg-neutral-100 font-medium" : "text-neutral-500 hover:text-neutral-900 hover:bg-neutral-50"}`}>
+                className={`flex items-center gap-2.5 px-3 py-2 text-[13px] rounded-md no-underline ${active ? "text-indigo-700 bg-indigo-50 font-medium" : "text-neutral-500 hover:text-neutral-900 hover:bg-neutral-50"}`}>
+                <item.icon className={`w-4 h-4 ${active ? "text-indigo-600" : "text-neutral-400"}`} />
                 {item.name}
               </Link>
             );

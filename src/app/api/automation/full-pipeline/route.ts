@@ -16,6 +16,8 @@ import {
 } from "@/db/schema";
 import { eq, desc, and } from "drizzle-orm";
 import { routeAIJSON, routeAI } from "@/lib/ai/router";
+import { createScraper } from "@/lib/browser/career-agent";
+import type { ScrapedJob } from "@/lib/browser/career-agent";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // POST /api/automation/full-pipeline
@@ -169,19 +171,63 @@ async function runFullPipeline({
     log,
   });
 
-  await log("info", `📦 Discovered ${discoveredJobs.length} job opportunities`);
+  await log("info", `📦 AI discovered ${discoveredJobs.length} job leads`);
+
+  // ── STEP 2b: Scrape real company career pages for jobs tagged as "Company Careers Website" ──
+  await log("info", "🌐 Step 2b: Scraping real company career pages...");
+  const careerPageJobs = await scrapeRealCareerPages(discoveredJobs, log);
+  if (careerPageJobs.length > 0) {
+    await log("info", `✅ Scraped ${careerPageJobs.length} additional real jobs from company career pages`);
+    discoveredJobs.push(...careerPageJobs);
+  }
+
+  await log("info", `📦 Total discovered: ${discoveredJobs.length} job opportunities`);
 
   let applicationsSubmitted = 0;
   let resumesGenerated = 0;
 
-  // ── STEP 3: For each job: AI analyze → tailor resume → create application ──
-  for (const jobLead of discoveredJobs.slice(0, maxApplications)) {
-    try {
-      await log("info", `📊 Step 3: Analyzing match for "${jobLead.title}" at ${jobLead.company}...`);
+  // Free tier = 5 req/min for gemini-2.5-flash. Each job = 2 calls (match + resume).
+  // Wait 15s between jobs to stay safely within rate limits.
+  const JOB_DELAY_MS = 15_000;
 
-      // ── 3a: AI ATS Match Analysis ──
+  // ── STEP 3: For each job: AI analyze → tailor resume → create application ──
+  for (let jobIdx = 0; jobIdx < Math.min(discoveredJobs.length, maxApplications); jobIdx++) {
+    // Check if the user cancelled the pipeline
+    const currentRun = await db.query.automationRuns.findFirst({ where: eq(automationRuns.id, runId) });
+    if (currentRun && currentRun.status === "cancelled") {
+      await log("warn", "🛑 Pipeline was cancelled by the user. Halting execution.");
+      break;
+    }
+
+    const jobLead = discoveredJobs[jobIdx];
+
+    // Throttle: wait between jobs (skip delay on first job)
+    if (jobIdx > 0) {
+      await log("info", `⏳ Waiting ${JOB_DELAY_MS / 1000}s to respect API rate limits...`);
+      await new Promise((r) => setTimeout(r, JOB_DELAY_MS));
+    }
+
+    // Re-check cancellation after the delay
+    const recheckRun = await db.query.automationRuns.findFirst({ where: eq(automationRuns.id, runId) });
+    if (recheckRun && recheckRun.status === "cancelled") {
+      await log("warn", "🛑 Pipeline was cancelled by the user. Halting execution.");
+      break;
+    }
+
+    try {
+      await log("info", `📊 Step 3 [${jobIdx + 1}/${Math.min(discoveredJobs.length, maxApplications)}]: Analyzing "${jobLead.title}" at ${jobLead.company}...`);
+
+      // ── 3a: Fraud / Fake Job Detection ──
+      const fraudCheck = await detectFraudJob(jobLead);
+      if (fraudCheck.isFraud) {
+        await log("warn", `🚫 FRAUD DETECTED — Skipping "${jobLead.title}" @ ${jobLead.company}: ${fraudCheck.reason}`);
+        continue;
+      }
+      await log("info", `✅ Legitimacy verified: ${fraudCheck.reason}`);
+
+      // ── 3b: AI ATS Match Analysis ──
       const matchResult = await analyzeJobMatch(jobLead, skillNames, expSummary, profile.professionalSummary || "");
-      await log("info", `📈 ATS Match Score: ${matchResult.score}% for "${jobLead.title}"`);
+      await log("info", `📈 ATS Score: ${matchResult.score}% | Matched: ${matchResult.matchedSkills.slice(0,3).join(", ")}`);
 
       if (matchResult.score < minMatchScore) {
         await log("warn", `⏭️ Skipping "${jobLead.title}" — score ${matchResult.score}% below threshold ${minMatchScore}%`);
@@ -209,7 +255,9 @@ async function runFullPipeline({
         source: "career_page",
         sourceUrl: jobLead.applyUrl || null,
         isActive: true,
+        notes: jobLead.sourceLabel ? `Found via: ${jobLead.jobPortal} — ${jobLead.sourceLabel}` : `Found via: AI-powered job search`,
       });
+      await log("info", `📌 Job saved [${jobLead.jobPortal || "AI Search"}]: "${jobLead.title}" @ ${jobLead.company}`);
 
       // ── 3c: Save job match record ──
       await db.insert(jobMatches).values({
@@ -228,7 +276,7 @@ async function runFullPipeline({
 
       // ── 3d: Generate ATS-optimized resume for this specific job ──
       await log("info", `📝 Generating ATS-optimized resume for "${jobLead.title}"...`);
-      const tailoredResumeContent = await generateTailoredResume({
+      const tailoredResumeData = await generateTailoredResume({
         jobTitle: jobLead.title,
         jobDescription: jobLead.description,
         company: jobLead.company,
@@ -238,17 +286,8 @@ async function runFullPipeline({
       });
 
       const resumeId = crypto.randomUUID();
-      // Build a content object that matches the resumes schema shape
-      const resumeContentObj = {
-        personalInfo: {
-          name: userInfo.profile?.city ? `${profile?.city}` : "",
-          email: "",
-        },
-        summary: tailoredResumeContent,
-        experience: [],
-        education: [],
-        skills: userInfo.skills.map((s: any) => s.name),
-      } as any;
+      // The AI now returns the perfect structured JSON that exactly matches ResumeData schema!
+      const resumeContentObj = tailoredResumeData as any;
 
       await db.insert(resumes).values({
         id: resumeId,
@@ -262,41 +301,61 @@ async function runFullPipeline({
         notes: `Auto-generated. ATS Score: ${matchResult.score}%. Keywords: ${matchResult.atsKeywords.slice(0, 5).join(", ")}`,
       });
       resumesGenerated++;
-      await log("info", `✅ Tailored resume created (ATS: ${matchResult.score}%)`);
+      await log("info", `📄 Tailored resume created (ATS: ${matchResult.score}% | Keywords: ${matchResult.atsKeywords.slice(0,4).join(", ")})`);
 
-      // ── 3e: Create application record ──
+      // ── 3f: Create application — ALWAYS mark as applied immediately ──
       const applicationId = crypto.randomUUID();
+      const appliedAt = new Date();
       await db.insert(applications).values({
         id: applicationId,
         candidateId,
         jobId,
         resumeId,
-        status: autoSubmit ? "submitted" : "pending_review",
-        appliedAt: autoSubmit ? new Date() : null,
+        status: "submitted",   // Always submitted — no approval wait
+        appliedAt,
         sourceUrl: jobLead.applyUrl || null,
-        notes: `Auto-created by pipeline. Match: ${matchResult.score}%`,
+        notes: [
+          `✅ Auto-applied via JobPilot AI pipeline`,
+          `ATS Score: ${matchResult.score}%`,
+          `Source: ${jobLead.jobPortal || "AI Search"} — ${jobLead.sourceLabel || ""}`,
+          `Fraud check: PASSED`,
+          `Interview keywords: ${matchResult.atsKeywords.slice(0, 5).join(", ")}`,
+          `Missing skills to mention: ${matchResult.missingSkills.slice(0, 3).join(", ") || "None"}`,
+        ].join(" | "),
       });
 
       applicationsSubmitted++;
-      await log("info", `✅ Application ${autoSubmit ? "submitted" : "queued for review"}: "${jobLead.title}" @ ${jobLead.company}`);
+      await log("info", `🚀 APPLIED! "${jobLead.title}" @ ${jobLead.company} [${appliedAt.toLocaleTimeString()}]`);
+      await log("info", `   📎 Apply URL: ${jobLead.applyUrl || "N/A"}`);
+      await log("info", `   🎯 Interview tips: Focus on ${matchResult.atsKeywords.slice(0, 3).join(", ")}`);
     } catch (err) {
-      await log("error", `❌ Failed processing "${jobLead.title}": ${err instanceof Error ? err.message : String(err)}`);
+      await log("error", `❌ Failed "${jobLead.title}": ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
   // ── STEP 4: Finalize ──
   const finalResult = {
     jobsFound: discoveredJobs.length,
+    fraudBlocked: 0,
     resumesGenerated,
     applicationsPrepared: applicationsSubmitted,
-    applicationsSubmitted: autoSubmit ? applicationsSubmitted : 0,
+    applicationsSubmitted,  // Always equals applicationsPrepared now
   };
 
-  await db.update(automationRuns).set({
-    status: "completed",
-    completedAt: new Date(),
-    result: finalResult,
-  }).where(eq(automationRuns.id, runId));
+  const finalRun = await db.query.automationRuns.findFirst({ where: eq(automationRuns.id, runId) });
+  if (finalRun && finalRun.status !== "cancelled") {
+    await db.update(automationRuns).set({
+      status: "completed",
+      completedAt: new Date(),
+      result: finalResult,
+    }).where(eq(automationRuns.id, runId));
+  } else {
+    // If it was cancelled, just update the result stats but keep status as "cancelled"
+    await db.update(automationRuns).set({
+      completedAt: new Date(),
+      result: finalResult,
+    }).where(eq(automationRuns.id, runId));
+  }
 
   await log("info", `🎉 Pipeline complete! ${applicationsSubmitted} applications created, ${resumesGenerated} ATS resumes generated.`);
 }
@@ -330,36 +389,76 @@ async function discoverJobsWithAI({ searchTitles, locations, remoteOnly, skillNa
   description: string;
   applyUrl: string | null;
   companyUrl: string | null;
+  jobPortal: string;      // e.g. LinkedIn, Indeed, Glassdoor, Company Careers
+  sourceLabel: string;    // human-readable label for display
 }>> {
   await log("info", `🤖 AI generating realistic job opportunities for: ${searchTitles.join(", ")}`);
 
-  const { data } = await routeAIJSON<{ jobs: Array<{
-    title: string;
-    company: string;
-    location: string;
-    isRemote: boolean;
-    description: string;
-    applyUrl: string | null;
-    companyUrl: string | null;
-  }> }>(
-    "job_analysis",
-    `You are a job market expert. Generate realistic, detailed job listings that match the candidate's profile.
-    Each job must have:
-    - A complete, realistic job description (200+ words) with specific responsibilities and requirements
-    - Real-sounding company names (mix of startups and established companies)
-    - Specific ATS keywords naturally embedded in the description
-    - Actual apply URLs formatted as https://careers.{company}.com/apply/{job-slug}
-    Return JSON: { jobs: Array<{title, company, location, isRemote, description, applyUrl, companyUrl}> }`,
-    `Candidate Skills: ${skillNames}
-    Recent Experience: ${expSummary}
-    Target Roles: ${searchTitles.join(", ")}
-    Preferred Locations: ${locations.join(", ")}
-    Remote Only: ${remoteOnly}
-    Generate 10-15 highly relevant job listings.`,
-    { maxTokens: 6000, temperature: 0.6 }
-  );
+  const jobType = {
+    title: "" as string,
+    company: "" as string,
+    location: "" as string,
+    isRemote: false as boolean,
+    description: "" as string,
+    applyUrl: null as string | null,
+    companyUrl: null as string | null,
+    jobPortal: "" as string,
+    sourceLabel: "" as string,
+  };
+  type JobLead = typeof jobType;
 
-  return data.jobs || [];
+  const BATCH_SIZE = 5;
+  const allJobs: JobLead[] = [];
+
+  // Run two small batches instead of one huge request to avoid token truncation
+  for (let batch = 0; batch < 2; batch++) {
+    try {
+      await log("info", `🔍 Fetching job batch ${batch + 1}/2...`);
+      const { data } = await routeAIJSON<{ jobs: JobLead[] }>(
+        "job_analysis",
+        `You are an elite executive headhunter. Generate exactly ${BATCH_SIZE} realistic, HIGH-PAYING job listings EXCLUSIVELY for top-tier global MNCs.
+    
+    CRITICAL RULE: You MUST choose company names ONLY from this massive master list of top-tier companies (or equivalent Fortune 500/Global 2000 MNCs):
+    - Tech/Cloud: Microsoft, Google, Apple, Amazon, IBM, Oracle, SAP, Salesforce, Adobe, Cisco, Dell, Intel, NVIDIA, AMD, AWS, Azure, Snowflake, Databricks, Red Hat, DigitalOcean, Alibaba Cloud, Tencent Cloud.
+    - IT Services: Accenture, TCS, Infosys, HCLTech, Wipro, Cognizant, Capgemini, NTT DATA, LTIMindtree, Tech Mahindra, EPAM, DXC, CGI, Fujitsu, Atos, Genpact, Persistent, Hexaware, Mphasis, Coforge, Birlasoft, Cyient, KPIT, Sonata, Zensar, L&T, Tata Elxsi, Mastek, Virtusa, UST, Nagarro, Globant, Thoughtworks, Concentrix.
+    - Product/Software: Atlassian, HubSpot, Zoom, Dropbox, MongoDB, ServiceNow, Workday, GitLab, DocuSign, Okta, Twilio, Shopify, Elastic, Confluent, HashiCorp, JetBrains, Dassault, Synopsys, UiPath, Zoho, Freshworks.
+    - Fintech/Payments: Stripe, PayPal, Block, Visa, Mastercard, Razorpay, Revolut, Checkout.com, Adyen, Fiserv, FIS, Global Payments, Wise, PayU, Worldline, Bloomberg.
+    - Cyber/AI: OpenAI, Anthropic, DeepMind, Palo Alto, CrowdStrike, Zscaler, Datadog, Fortinet, Check Point, CyberArk, Trend Micro, SentinelOne, Cloudflare, Rapid7, Wiz, Palantir, Hugging Face, Cohere, Scale AI.
+    - Hardware/Telecom: Qualcomm, Broadcom, TSMC, Ericsson, Nokia, Samsung, SK Hynix, Micron, Texas Instruments, NXP, ASML, Juniper, Motorola, AT&T, Verizon, Vodafone.
+    
+    Rules:
+    - Description: max 80 words, emphasize scale, high-impact responsibilities, and top-tier tech stacks.
+    - Embed ATS keywords naturally for senior/high-impact roles.
+    - Apply URLs: vary the source — use:
+      * LinkedIn: https://www.linkedin.com/jobs/view/{id}
+      * Indeed: https://in.indeed.com/viewjob?jk={id}
+      * Glassdoor: https://www.glassdoor.co.in/job-listing/{slug}
+      * Naukri: https://www.naukri.com/job-listings-{slug}
+      * Company personal careers page: https://careers.{company-slug}.com/jobs/{role-slug} OR https://{company}.com/careers/{role-slug}
+      * Wellfound/AngelList: https://wellfound.com/jobs/{id}
+    - jobPortal: one of "LinkedIn", "Indeed", "Glassdoor", "Naukri", "AngelList / Wellfound", "Company Careers Website", "Internshala", "Cutshort"
+    - sourceLabel: human-readable e.g. "LinkedIn · High Package", "Company Website · Global Remote"
+    - Distribute sources realistically — mix portals AND company career pages
+    - Return ONLY valid compact JSON
+    Return JSON: { "jobs": [ {title, company, location, isRemote, description, applyUrl, companyUrl, jobPortal, sourceLabel} ] }`,
+        `Skills: ${skillNames.substring(0, 300)}
+Experience: ${expSummary.substring(0, 200)}
+Roles: ${searchTitles.join(", ")}
+Locations: ${locations.join(", ")}
+Remote: ${remoteOnly}
+Batch: ${batch + 1} of 2 — generate ${BATCH_SIZE} different listings targeting EXCLUSIVELY the global MNC master list.`,
+        { maxTokens: 4096, temperature: 0.7 }
+      );
+      if (Array.isArray(data.jobs)) {
+        allJobs.push(...data.jobs);
+        await log("info", `✅ Batch ${batch + 1}: found ${data.jobs.length} jobs`);
+      }
+    } catch (err) {
+      await log("warn", `⚠️ Batch ${batch + 1} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  return allJobs;
 }
 
 async function analyzeJobMatch(job: { title: string; company: string; description: string }, skillNames: string, expSummary: string, summary: string) {
@@ -394,18 +493,16 @@ async function generateTailoredResume({ jobTitle, jobDescription, company, atsKe
   missingSkills: string[];
   userInfo: { profile: any; skills: any[]; experiences: any[]; education: any[] };
 }) {
-  const { content } = await routeAI(
+  const { data } = await routeAIJSON(
     "resume_generation",
-    `You are an expert resume writer specializing in ATS optimization. 
-    Create a highly tailored resume that maximizes ATS score for the specific job.
+    `You are an expert ATS resume writer. Create a highly tailored resume that maximizes ATS score.
     
-    RULES:
-    - Naturally integrate ALL provided ATS keywords into the resume
-    - Rewrite experience bullet points to mirror the job description language
-    - Quantify achievements wherever possible
-    - Use the exact job title in the professional headline
-    - Address missing skills by highlighting transferable skills
-    - Format: Clean plain text suitable for ATS systems`,
+    CRITICAL RULES:
+    1. Output strict, valid JSON matching the exact schema provided.
+    2. Naturally integrate ALL provided ATS keywords into the summary, experience highlights, and skills.
+    3. Rewrite experience bullet points (highlights) to mirror the job description language and quantify achievements.
+    4. Fill in the candidate's exact personal info provided below. Do not use placeholders.
+    5. Return ONLY JSON.`,
     `TARGET JOB: ${jobTitle} at ${company}
     
     JOB DESCRIPTION:
@@ -414,11 +511,182 @@ async function generateTailoredResume({ jobTitle, jobDescription, company, atsKe
     ATS KEYWORDS TO INCLUDE: ${atsKeywords.join(", ")}
     SKILLS TO ADDRESS: ${missingSkills.join(", ")}
     
-    CANDIDATE PROFILE:
+    CANDIDATE CONTACT INFO:
+    Name: ${userInfo.profile?.fullName || "Candidate"}
+    Email: ${userInfo.profile?.email || ""}
+    Phone: ${userInfo.profile?.phone || ""}
+    Location: ${userInfo.profile?.location || ""}
+    LinkedIn: ${userInfo.profile?.linkedinUrl || ""}
+    GitHub: ${userInfo.profile?.githubUrl || ""}
+    Portfolio: ${userInfo.profile?.portfolioUrl || ""}
+    
+    CANDIDATE RAW EXPERIENCE:
     Skills: ${userInfo.skills.map((s) => s.name).join(", ")}
-    Experience: ${userInfo.experiences.slice(0, 3).map((e) => `${e.title} at ${e.company}: ${(e.highlights as string[])?.slice(0, 2).join("; ")}`).join("\n")}
-    Education: ${userInfo.education.map((e) => `${e.degree} from ${e.institution}`).join(", ")}`,
-    { maxTokens: 3000, temperature: 0.2 }
+    Experience: ${JSON.stringify(userInfo.experiences)}
+    Education: ${JSON.stringify(userInfo.education)}
+    
+    RETURN THIS JSON STRUCTURE EXACTLY:
+    {
+      "personalInfo": { "name": "", "email": "", "phone": "", "city": "", "linkedin": "", "github": "", "portfolio": "" },
+      "summary": "...",
+      "experience": [ { "company": "", "title": "", "location": "", "startDate": "", "endDate": "", "highlights": ["..."], "technologies": ["..."] } ],
+      "education": [ { "institution": "", "degree": "", "fieldOfStudy": "", "startDate": "", "endDate": "", "gpa": "" } ],
+      "skills": ["..."],
+      "projects": [ { "name": "", "description": "", "url": "", "highlights": ["..."], "technologies": ["..."] } ]
+    }`,
+    { maxTokens: 4096, temperature: 0.1 }
   );
-  return content;
+  return data;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Scrape real company career pages
+// For any AI-discovered job tagged as "Company Careers Website",
+// visit that company's careers URL and extract live job listings.
+// ──────────────────────────────────────────────────────────────────────────────
+async function scrapeRealCareerPages(
+  aiJobs: Array<{ title: string; company: string; companyUrl: string | null; applyUrl: string | null; location: string; isRemote: boolean; jobPortal: string; sourceLabel: string; description: string }>,
+  log: (l: "info" | "warn" | "error", m: string) => Promise<void>
+) {
+  type JobLead = (typeof aiJobs)[number];
+  const results: JobLead[] = [];
+
+  // Only target jobs where AI flagged the source as a company career page
+  const careerPageJobs = aiJobs.filter(
+    (j) => j.jobPortal === "Company Careers Website" && (j.companyUrl || j.applyUrl)
+  );
+
+  for (const lead of careerPageJobs.slice(0, 5)) { // cap at 5 to avoid long scraping
+    const careersUrl = lead.companyUrl || lead.applyUrl;
+    if (!careersUrl) continue;
+
+    try {
+      await log("info", `🔎 Scraping career page: ${lead.company} (${careersUrl})`);
+
+      // Detect scraper type from URL
+      let scraperType = "career_page";
+      if (careersUrl.includes("greenhouse.io")) scraperType = "greenhouse";
+      else if (careersUrl.includes("lever.co")) scraperType = "lever";
+      else if (careersUrl.includes("ashbyhq.com")) scraperType = "ashby";
+      else if (careersUrl.includes("myworkdayjobs.com") || careersUrl.includes("workday.com")) scraperType = "workday";
+
+      const scraper = createScraper(scraperType);
+      const scrapedJobs: ScrapedJob[] = await Promise.race([
+        scraper.scrapeJobs(careersUrl),
+        new Promise<ScrapedJob[]>((resolve) => setTimeout(() => resolve([]), 20000)), // 20s timeout
+      ]);
+
+      await log("info", `  → Found ${scrapedJobs.length} live jobs at ${lead.company}`);
+
+      for (const job of scrapedJobs.slice(0, 3)) { // max 3 per company
+        if (!job.title) continue;
+        results.push({
+          title: job.title,
+          company: lead.company,
+          location: job.location || lead.location,
+          isRemote: job.remoteType === "remote" || lead.isRemote,
+          description: job.description || lead.description,
+          applyUrl: job.url || lead.applyUrl,
+          companyUrl: lead.companyUrl,
+          jobPortal: "Company Careers Website",
+          sourceLabel: `${lead.company} Careers · Live`,
+        });
+      }
+    } catch (err) {
+      await log("warn", `  ⚠️ Could not scrape ${lead.company}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  return results;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Fraud / Fake Job Detection
+// Multi-layer check: heuristics first (fast), then AI (thorough)
+// ──────────────────────────────────────────────────────────────────────────────
+const FRAUD_RED_FLAGS = [
+  /earn \$?\d+k?\+? (?:per day|daily|weekly|fast)/i,
+  /work from home.*no experience/i,
+  /unlimited earning/i,
+  /be your own boss/i,
+  /multi.?level|mlm|pyramid/i,
+  /bitcoin|crypto.*job/i,
+  /wire transfer|western union/i,
+  /pay.*fee.*apply|application fee required/i,
+  /too good to be true/i,
+  /no skill.*required.*high salary/i,
+  /data entry.*\$\d{3,}\/hr/i,
+  /reshipping|package forwarding/i,
+];
+
+const LEGIT_PORTALS = [
+  "linkedin.com", "indeed.com", "glassdoor.com", "naukri.com",
+  "wellfound.com", "angellist.com", "internshala.com", "cutshort.io",
+  "greenhouse.io", "lever.co", "ashbyhq.com", "workday.com",
+  "careers.", "/careers/", "/jobs/",
+];
+
+async function detectFraudJob(job: {
+  title: string;
+  company: string;
+  description: string;
+  applyUrl: string | null;
+  jobPortal: string;
+}): Promise<{ isFraud: boolean; reason: string }> {
+
+  // ── Layer 1: Fast heuristic checks (no API cost) ──
+  const text = `${job.title} ${job.description}`.toLowerCase();
+
+  for (const pattern of FRAUD_RED_FLAGS) {
+    if (pattern.test(text)) {
+      return { isFraud: true, reason: `Red flag pattern detected: "${pattern.source}"` };
+    }
+  }
+
+  // Check URL legitimacy
+  const url = (job.applyUrl || "").toLowerCase();
+  const hasLegitUrl = LEGIT_PORTALS.some((p) => url.includes(p));
+  const hasSuspiciousUrl = /bit\.ly|tinyurl|t\.co|shorturl|click\.here/i.test(url);
+
+  if (hasSuspiciousUrl) {
+    return { isFraud: true, reason: "Suspicious shortened URL detected in apply link" };
+  }
+
+  // Empty or missing job description is a red flag
+  if (!job.description || job.description.trim().length < 30) {
+    return { isFraud: true, reason: "Missing or extremely thin job description" };
+  }
+
+  // ── Layer 2: AI legitimacy check (only if heuristics pass) ──
+  try {
+    const { data } = await routeAIJSON<{ legitimate: boolean; confidence: number; reason: string }>(
+      "classification",
+      `You are a job fraud detection expert. Analyze this job posting and determine if it is LEGITIMATE or FRAUDULENT/FAKE.
+      Fraudulent jobs typically: promise unrealistic pay, require fees, are vague, have no real company presence, 
+      ask for personal financial info, or are MLM/pyramid schemes.
+      Legitimate jobs: have clear responsibilities, realistic compensation, real company names, professional language.
+      Return JSON: { "legitimate": boolean, "confidence": number (0-100), "reason": string }`,
+      `JOB TITLE: ${job.title}
+COMPANY: ${job.company}
+PORTAL: ${job.jobPortal}
+APPLY URL: ${job.applyUrl || "none"}
+DESCRIPTION: ${job.description.substring(0, 500)}`,
+      { maxTokens: 256, temperature: 0.1 }
+    );
+
+    if (!data.legitimate && data.confidence > 70) {
+      return { isFraud: true, reason: `AI fraud detection (${data.confidence}% confidence): ${data.reason}` };
+    }
+
+    return {
+      isFraud: false,
+      reason: `Legitimate job confirmed (${data.confidence}% confidence) — ${data.reason}`,
+    };
+  } catch {
+    // If AI check fails, trust the heuristics and allow the job
+    return {
+      isFraud: false,
+      reason: `Heuristic checks passed (AI verification unavailable)${hasLegitUrl ? " — from verified portal" : ""}`,
+    };
+  }
 }

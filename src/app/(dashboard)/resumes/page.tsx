@@ -17,7 +17,10 @@ export default function ResumesPage() {
   const fetchResumes = async () => {
     try { const r = await fetch("/api/resumes"); if (r.ok) { const d = await r.json(); setResumes(d.resumes); } } catch {} finally { setLoading(false); }
   };
-  useEffect(() => { fetchResumes(); }, []);
+  useEffect(() => { 
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    fetchResumes(); 
+  }, []);
 
   const generate = async () => {
     setGenerating(true);

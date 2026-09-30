@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
+import { Zap, AlertTriangle, RefreshCw, Terminal, Square } from "lucide-react";
 
 type RunEvent = { id: string; level: string; message: string; createdAt: string };
 type Run = {
@@ -119,7 +120,23 @@ export default function AutomationPipelinePage() {
     }
   };
 
-  const isRunning = run?.status === "running" || !!activeRunId;
+  const stopPipeline = async () => {
+    if (!activeRunId) return;
+    try {
+      await fetch("/api/automation/stop-pipeline", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runId: activeRunId }),
+      });
+      // Set to cancelled immediately in UI so button updates instantly
+      if (run) setRun({ ...run, status: "cancelled" });
+      setActiveRunId(null); 
+    } catch (err) {
+      console.error("Failed to stop pipeline", err);
+    }
+  };
+
+  const isRunning = run?.status === "running" || (!!activeRunId && run?.status !== "cancelled");
 
   return (
     <div className="max-w-6xl mx-auto space-y-8">
@@ -177,34 +194,45 @@ export default function AutomationPipelinePage() {
           </div>
 
           {!autoSubmit && (
-            <p className="text-xs text-amber-600 bg-amber-50 border border-amber-100 rounded-lg p-3">
-              ⚠️ Applications will be queued for your review before submitting. Check <Link href="/applications" className="underline font-medium">Applications</Link> page to approve.
+            <p className="text-xs text-amber-600 bg-amber-50 border border-amber-100 rounded-lg p-3 flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>
+                Applications will be queued for your review before submitting. Check <Link href="/applications" className="underline font-medium">Applications</Link> page to approve.
+              </span>
             </p>
           )}
 
-          <button
-            onClick={startPipeline}
-            disabled={isStarting || isRunning}
-            className="w-full py-3 px-6 bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-bold rounded-xl hover:from-indigo-700 hover:to-purple-700 disabled:opacity-60 disabled:cursor-not-allowed transition-all text-sm shadow-lg shadow-indigo-500/25 flex items-center justify-center gap-2"
-          >
-            {isRunning ? (
-              <>
-                <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
-                Pipeline Running...
-              </>
-            ) : isStarting ? (
-              "Starting..."
-            ) : (
-              "🚀 Start Full Automation"
-            )}
-          </button>
+          {isRunning ? (
+            <button
+              onClick={stopPipeline}
+              className="w-full py-3 px-6 bg-gradient-to-r from-red-500 to-rose-600 text-white font-bold rounded-xl hover:from-red-600 hover:to-rose-700 transition-all text-sm shadow-lg shadow-red-500/25 flex items-center justify-center gap-2"
+            >
+              <Square className="w-4 h-4 fill-current" />
+              Stop Pipeline
+            </button>
+          ) : (
+            <button
+              onClick={startPipeline}
+              disabled={isStarting}
+              className="w-full py-3 px-6 bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-bold rounded-xl hover:from-indigo-700 hover:to-purple-700 disabled:opacity-60 disabled:cursor-not-allowed transition-all text-sm shadow-lg shadow-indigo-500/25 flex items-center justify-center gap-2"
+            >
+              {isStarting ? (
+                "Starting..."
+              ) : (
+                <>
+                  <Zap className="w-4 h-4" />
+                  Start Full Automation
+                </>
+              )}
+            </button>
+          )}
         </div>
 
         {/* Live Log Panel */}
-        <div className="bg-neutral-900 rounded-2xl border border-neutral-700 shadow-xl overflow-hidden flex flex-col">
-          <div className="flex items-center justify-between px-5 py-3 border-b border-neutral-700/60">
+        <div className="bg-neutral-900 rounded-2xl border border-neutral-700 shadow-xl flex flex-col h-[600px]">
+          <div className="flex items-center justify-between px-5 py-3 border-b border-neutral-700/60 shrink-0">
             <div className="flex items-center gap-2">
-              <span className={`w-2.5 h-2.5 rounded-full ${isRunning ? "bg-green-400 animate-pulse" : run?.status === "completed" ? "bg-emerald-400" : run?.status === "failed" ? "bg-red-400" : "bg-neutral-600"}`}></span>
+              <Terminal className="w-4 h-4 text-neutral-400" />
               <h2 className="text-sm font-bold text-white">Live Pipeline Logs</h2>
             </div>
             {run && (
@@ -213,14 +241,17 @@ export default function AutomationPipelinePage() {
               </span>
             )}
           </div>
-          <div ref={logRef} className="flex-1 overflow-y-auto p-4 space-y-1 font-mono text-xs h-80">
+          <div ref={logRef} className="flex-1 overflow-y-auto p-4 space-y-1 font-mono text-xs min-h-0">
             {!run && !activeRunId && (
               <p className="text-neutral-500 italic">Configure the pipeline above and click Start to begin...</p>
             )}
             {activeRunId && !run && (
-              <p className="text-blue-400">🔄 Connecting to pipeline {activeRunId}...</p>
+              <p className="text-blue-400 flex items-center gap-2">
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                Connecting to pipeline {activeRunId}...
+              </p>
             )}
-            {run?.events.slice().reverse().map((ev) => (
+            {run?.events.map((ev) => (
               <div key={ev.id} className={`${LOG_COLORS[ev.level] || "text-neutral-400"} leading-relaxed`}>
                 <span className="text-neutral-600">[{new Date(ev.createdAt).toLocaleTimeString()}]</span> {ev.message}
               </div>

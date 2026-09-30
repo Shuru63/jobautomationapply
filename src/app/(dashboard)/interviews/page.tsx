@@ -53,6 +53,7 @@ export default function InterviewsPage() {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchInterviews();
   }, [fetchInterviews]);
 

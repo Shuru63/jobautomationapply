@@ -11,7 +11,7 @@ function ensureDir(dir: string) {
 }
 
 // Check if Cloudinary is configured
-function useCloudinary(): boolean {
+function isCloudinaryConfigured(): boolean {
   return !!(process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET && process.env.CLOUDINARY_CLOUD_NAME);
 }
 
@@ -52,7 +52,7 @@ export async function saveFile(
 ): Promise<{ fileUrl: string; filePath: string }> {
   const uniqueName = `${Date.now()}-${fileName.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
 
-  if (useCloudinary()) {
+  if (isCloudinaryConfigured()) {
     const resourceType = (fileName.endsWith(".pdf") || fileName.endsWith(".docx") || fileName.endsWith(".doc")) ? "raw" : "auto";
     const fileUrl = await saveToCloudinary(buffer, subDir, resourceType);
     if (fileUrl) return { fileUrl, filePath: "" };
@@ -72,7 +72,7 @@ export async function saveScreenshot(
 ): Promise<string> {
   const fileName = `screenshot-${label}-${Date.now()}.png`;
 
-  if (useCloudinary()) {
+  if (isCloudinaryConfigured()) {
     const fileUrl = await saveToCloudinary(buffer, "screenshots", "image");
     if (fileUrl) return fileUrl;
   }

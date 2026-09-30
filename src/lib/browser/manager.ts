@@ -7,25 +7,35 @@ export class BrowserManager {
   private context: BrowserContext | null = null;
 
   async launch(): Promise<void> {
-    this.browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-      ],
-    });
-    this.context = await this.browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      viewport: { width: 1280, height: 800 },
-    });
+    try {
+      this.browser = await chromium.launch({
+        headless: true,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+        ],
+      });
+      this.context = await this.browser.newContext({
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        viewport: { width: 1280, height: 800 },
+      });
+    } catch (error) {
+      console.warn("⚠️ Playwright launch failed. Is playwright installed? (Run `npx playwright install chromium`)", error);
+      // Ensure we don't leave partial state
+      this.browser = null;
+      this.context = null;
+    }
   }
 
   async newPage(): Promise<Page> {
     if (!this.context) await this.launch();
-    return this.context!.newPage();
+    if (!this.context) {
+      throw new Error("Failed to initialize browser context. Playwright may not be installed correctly.");
+    }
+    return this.context.newPage();
   }
 
   async takeScreenshot(page: Page, candidateId: string, label: string): Promise<string> {
