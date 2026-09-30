@@ -48,17 +48,27 @@ export type ResumeData = {
 };
 
 function renderResumeHTML(data: ResumeData): string {
-  const skillsHTML = data.skills.map((s) => `<span class="skill">${s}</span>`).join("");
+  const skillsHTML = data.skills
+    .map((s) => {
+      if (s.includes(":")) {
+        const [cat, ...rest] = s.split(":");
+        return `<p style="margin-bottom: 3px; font-size: 11px;"><strong>${cat}:</strong> ${rest.join(":")}</p>`;
+      }
+      return `<p style="margin-bottom: 3px; font-size: 11px;">${s}</p>`;
+    })
+    .join("");
+
   const expHTML = data.experience
     .map(
       (e) => `
     <div class="entry">
       <div class="entry-header">
-        <div><strong>${e.title}</strong> at <strong>${e.company}</strong>${e.location ? ` — ${e.location}` : ""}</div>
-        <div class="date">${e.startDate} — ${e.endDate || "Present"}</div>
+        <div class="entry-title"><strong>${e.title}</strong></div>
+        <div class="date"><strong>${e.startDate} — ${e.endDate || "Present"}</strong></div>
       </div>
+      <div class="entry-subtitle"><em>${e.company}${e.location ? ` • ${e.location}` : ""}</em></div>
       ${e.highlights.length ? `<ul>${e.highlights.map((h) => `<li>${h}</li>`).join("")}</ul>` : ""}
-      ${e.technologies?.length ? `<div class="tech">${e.technologies.join(" · ")}</div>` : ""}
+      ${e.technologies?.length ? `<div class="tech">Technologies: ${e.technologies.join(", ")}</div>` : ""}
     </div>`
     )
     .join("");
@@ -68,8 +78,8 @@ function renderResumeHTML(data: ResumeData): string {
       (e) => `
     <div class="entry">
       <div class="entry-header">
-        <div><strong>${e.degree}</strong>${e.fieldOfStudy ? ` in ${e.fieldOfStudy}` : ""} — ${e.institution}</div>
-        <div class="date">${e.startDate || ""} — ${e.endDate || ""}${e.gpa ? ` | GPA: ${e.gpa}` : ""}</div>
+        <div class="entry-title">${e.degree}${e.fieldOfStudy ? ` — ${e.fieldOfStudy}` : ""} — ${e.institution}</div>
+        <div class="date"><strong>CGPA/GPA: ${e.gpa || "N/A"}</strong></div>
       </div>
     </div>`
     )
@@ -80,75 +90,62 @@ function renderResumeHTML(data: ResumeData): string {
       (p) => `
     <div class="entry">
       <div class="entry-header">
-        <div><strong>${p.name}</strong>${p.url ? ` — <a href="${p.url}">${p.url}</a>` : ""}</div>
+        <div class="entry-title"><strong>${p.name}</strong>${p.url ? ` — <a href="${p.url}">${p.url}</a>` : ""}</div>
       </div>
       ${p.description ? `<p>${p.description}</p>` : ""}
       ${p.highlights?.length ? `<ul>${p.highlights.map((h) => `<li>${h}</li>`).join("")}</ul>` : ""}
-      ${p.technologies?.length ? `<div class="tech">${p.technologies.join(" · ")}</div>` : ""}
     </div>`
     )
-    .join("");
-
-  const certsHTML = (data.certifications || [])
-    .map((c) => `<span class="cert">${c.name}${c.issuer ? ` (${c.issuer})` : ""}</span>`)
-    .join("");
-
-  const langsHTML = (data.languages || [])
-    .map((l) => `<span class="lang">${l.name}${l.level ? ` — ${l.level}` : ""}</span>`)
     .join("");
 
   const contacts = [
     data.personalInfo.email,
     data.personalInfo.phone,
-    data.personalInfo.city,
     data.personalInfo.linkedin ? `<a href="${data.personalInfo.linkedin}">LinkedIn</a>` : "",
     data.personalInfo.github ? `<a href="${data.personalInfo.github}">GitHub</a>` : "",
     data.personalInfo.portfolio ? `<a href="${data.personalInfo.portfolio}">Portfolio</a>` : "",
   ]
     .filter(Boolean)
-    .join(" · ");
+    .join(" | ");
 
   return `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
-  @page { margin: 40px 50px; size: A4; }
+  @page { margin: 35px 45px; size: A4; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px; line-height: 1.5; color: #1a1a1a; }
-  .header { text-align: center; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 2px solid #2563eb; }
-  .header h1 { font-size: 22px; color: #1e3a8a; margin-bottom: 4px; }
-  .header .headline { font-size: 13px; color: #4b5563; margin-bottom: 6px; }
-  .header .contacts { font-size: 10px; color: #6b7280; }
-  .section { margin-bottom: 14px; }
-  .section-title { font-size: 13px; font-weight: 700; color: #1e40af; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #dbeafe; padding-bottom: 3px; margin-bottom: 8px; }
-  .summary { font-size: 11px; color: #374151; }
-  .skills-container { display: flex; flex-wrap: wrap; gap: 4px; }
-  .skill { background: #eff6ff; color: #1d4ed8; padding: 2px 8px; border-radius: 3px; font-size: 10px; font-weight: 500; }
+  body { font-family: 'Arial', sans-serif; font-size: 11px; line-height: 1.4; color: #333; }
+  a { color: #1e40af; text-decoration: none; }
+  .header { text-align: left; margin-bottom: 12px; }
+  .header h1 { font-size: 24px; color: #1e3a8a; margin-bottom: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .header .headline { font-size: 12px; color: #4b5563; font-style: italic; margin-bottom: 4px; }
+  .header .contacts { font-size: 11px; color: #4b5563; padding-bottom: 8px; border-bottom: 1px solid #93c5fd; }
+  .section { margin-bottom: 12px; }
+  .section-title { font-size: 12px; font-weight: bold; color: #1e3a8a; text-transform: uppercase; border-bottom: 1px solid #1e3a8a; padding-bottom: 2px; margin-bottom: 6px; }
+  .summary { font-size: 11px; text-align: justify; }
   .entry { margin-bottom: 10px; }
   .entry-header { display: flex; justify-content: space-between; align-items: baseline; }
-  .entry-header strong { color: #111827; }
-  .date { font-size: 10px; color: #6b7280; white-space: nowrap; }
-  .entry ul { margin: 4px 0 0 16px; }
-  .entry li { font-size: 10.5px; color: #374151; margin-bottom: 2px; }
-  .entry p { font-size: 10.5px; color: #4b5563; margin-top: 2px; }
-  .tech { font-size: 9.5px; color: #6b7280; margin-top: 3px; }
-  .cert, .lang { background: #f3f4f6; padding: 2px 6px; border-radius: 3px; font-size: 10px; margin-right: 4px; display: inline-block; margin-bottom: 3px; }
+  .entry-title { font-size: 11.5px; color: #111827; }
+  .entry-subtitle { font-size: 11px; color: #4b5563; margin-bottom: 3px; }
+  .date { font-size: 11px; color: #374151; white-space: nowrap; }
+  .entry ul { margin: 3px 0 0 16px; padding-left: 4px; }
+  .entry li { font-size: 11px; margin-bottom: 3px; text-align: justify; }
+  .entry p { font-size: 11px; margin-top: 2px; }
+  .tech { font-size: 10.5px; color: #4b5563; margin-top: 2px; font-style: italic; }
 </style>
 </head>
 <body>
   <div class="header">
     <h1>${data.personalInfo.name}</h1>
-    ${data.summary ? `<div class="headline">${data.summary.substring(0, 120)}</div>` : ""}
+    ${data.summary ? `<div class="headline">Tailored Application Resume</div>` : ""}
     <div class="contacts">${contacts}</div>
   </div>
   ${data.summary ? `<div class="section"><div class="section-title">Professional Summary</div><div class="summary">${data.summary}</div></div>` : ""}
-  ${data.skills.length ? `<div class="section"><div class="section-title">Skills</div><div class="skills-container">${skillsHTML}</div></div>` : ""}
-  ${data.experience.length ? `<div class="section"><div class="section-title">Experience</div>${expHTML}</div>` : ""}
+  ${data.skills.length ? `<div class="section"><div class="section-title">Technical Skills</div><div>${skillsHTML}</div></div>` : ""}
+  ${data.experience.length ? `<div class="section"><div class="section-title">Professional Experience</div>${expHTML}</div>` : ""}
+  ${data.projects?.length ? `<div class="section"><div class="section-title">Key Projects</div>${projectsHTML}</div>` : ""}
   ${data.education.length ? `<div class="section"><div class="section-title">Education</div>${eduHTML}</div>` : ""}
-  ${data.projects?.length ? `<div class="section"><div class="section-title">Projects</div>${projectsHTML}</div>` : ""}
-  ${data.certifications?.length ? `<div class="section"><div class="section-title">Certifications</div><div>${certsHTML}</div></div>` : ""}
-  ${data.languages?.length ? `<div class="section"><div class="section-title">Languages</div><div>${langsHTML}</div></div>` : ""}
 </body>
 </html>`;
 }

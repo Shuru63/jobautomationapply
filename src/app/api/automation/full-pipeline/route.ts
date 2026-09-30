@@ -524,6 +524,7 @@ async function generateTailoredResume({ jobTitle, jobDescription, company, atsKe
     Skills: ${userInfo.skills.map((s) => s.name).join(", ")}
     Experience: ${JSON.stringify(userInfo.experiences)}
     Education: ${JSON.stringify(userInfo.education)}
+    Projects: ${JSON.stringify(userInfo.profile?.projects || [])}
     
     RETURN THIS JSON STRUCTURE EXACTLY:
     {
@@ -531,7 +532,7 @@ async function generateTailoredResume({ jobTitle, jobDescription, company, atsKe
       "summary": "...",
       "experience": [ { "company": "", "title": "", "location": "", "startDate": "", "endDate": "", "highlights": ["..."], "technologies": ["..."] } ],
       "education": [ { "institution": "", "degree": "", "fieldOfStudy": "", "startDate": "", "endDate": "", "gpa": "" } ],
-      "skills": ["..."],
+      "skills": ["Backend: Node.js, Express.js...", "Frontend: React.js, TypeScript...", "Databases: MongoDB...", "Cloud & DevOps: AWS..."],
       "projects": [ { "name": "", "description": "", "url": "", "highlights": ["..."], "technologies": ["..."] } ]
     }`,
     { maxTokens: 4096, temperature: 0.1 }
